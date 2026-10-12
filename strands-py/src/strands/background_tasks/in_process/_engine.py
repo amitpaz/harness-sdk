@@ -25,6 +25,7 @@ from ._types import (
 )
 
 _DEFAULT_EXECUTION_FAILURE_MESSAGE = "Background task execution failed"
+_MAX_PROGRESS_LENGTH = 512
 
 
 @dataclass
@@ -94,6 +95,24 @@ class InProcessTaskEngine:
     def list(self) -> list[InProcessTaskRecord]:
         """Return all task snapshots."""
         return [copy.deepcopy(task) for task in self._tasks.values()]
+
+    def report_progress(self, task_id: str, text: str) -> None:
+        """Store the latest bounded progress update while a task is working."""
+        if task_id not in self._tasks:
+            return
+
+        def update(record: InProcessTaskRecord) -> bool:
+            if record["status"] != "working":
+                return False
+            previous = record.get("progress")
+            record["progress"] = {
+                "message": text[-_MAX_PROGRESS_LENGTH:],
+                "update_count": previous["update_count"] + 1 if previous is not None else 1,
+                "updated_at": _timestamp(),
+            }
+            return True
+
+        self._update_task(task_id, update)
 
     def remove(self, task_id: str) -> None:
         """Remove a terminal task."""

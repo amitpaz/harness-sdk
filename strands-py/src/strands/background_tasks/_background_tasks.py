@@ -124,18 +124,25 @@ class _BackgroundTasks(Plugin):
     @tool(
         name=_MANAGE_TOOL_NAME,
         description=(
-            "List, get, or cancel background tasks. Results are delivered automatically as synthetic 'get' calls. "
+            "List, get progress, message, or cancel background tasks. "
+            "Results are delivered automatically as synthetic 'get' calls. "
             "Do not poll for results."
         ),
     )
     async def _manage_background_task(
-        self, mode: Literal["list", "get", "cancel"], task_id: str | None = None
+        self, mode: Literal["list", "get", "message", "cancel"], task_id: str | None = None, message: str | None = None
     ) -> dict[str, Any]:
         """Manage tracked background tasks.
 
         Args:
-            mode: Whether to list, inspect, or cancel background tasks.
-            task_id: The background task ID returned when the task was dispatched. Required for get and cancel.
+            mode: Whether to list, inspect, message, or cancel background tasks.
+            task_id: The background task ID returned when dispatched. Required except for list.
+            message: Input for a running task that accepts messages. Required for message mode.
+
+        Raises:
+            TypeError: If required arguments are missing or the mode is unknown.
+            BackgroundTaskNotFoundError: If the task is unknown.
+            RuntimeError: If the task cannot accept a message.
         """
         if mode == "list":
             listing = [
@@ -151,6 +158,13 @@ class _BackgroundTasks(Plugin):
             raise BackgroundTaskNotFoundError(task_id)
         if mode == "get":
             return {"status": "success", "content": _task_result_content(task)}
+        if mode == "message":
+            if message is None:
+                raise TypeError("Message is required for mode 'message'")
+            await self._manager.message(task_id, message)
+            return {"status": "success", "content": [{"json": {"task_id": task_id, "message_sent": True}}]}
+        if mode != "cancel":
+            raise TypeError(f"Unknown background task mode '{mode}'")
         cancelled = task if is_task_status_terminal(task["status"]) else await self._manager.cancel(task_id)
         return {
             "status": "success",
@@ -249,6 +263,7 @@ class _BackgroundTasks(Plugin):
         recovered_interrupt_ids: set[str] = set()
         tasks: dict[str, BackgroundTask] = {}
         for task in stored:
+            task.pop("progress", None)
             if not is_task_status_terminal(task["status"]):
                 recovered_interrupt_ids.update(interrupt["id"] for interrupt in task.pop("interrupts", []))
                 task["status"] = "failed"
@@ -335,21 +350,35 @@ class _BackgroundTasks(Plugin):
             and not any(task["status"] == "input_required" for task in tasks)
             and any(not is_task_status_terminal(task["status"]) for task in tasks)
         ):
+            if self._config.get("wake_on_input", False) and self._agent._inbox.has_messages():
+                break
             await self._await_next_settlement(tasks)
             tasks = self._task_snapshots()
+        if self._config.get("wake_on_input", False) and self._agent.cancel_signal.is_set():
+            return
         if any(task["status"] == "input_required" for task in tasks):
             if event.resume is None:
                 event.resume = []
             return
         self._deliver_ready(event, tasks)
+        if (
+            self._config.get("wait_for_completion", True)
+            and self._config.get("wake_on_input", False)
+            and any(not is_task_status_terminal(task["status"]) for task in tasks)
+            and self._agent._inbox.has_messages()
+            and event.resume is None
+        ):
+            event.resume = []
 
     async def _await_next_settlement(self, tasks: Sequence[BackgroundTask]) -> None:
-        """Wait until one pending task settles or the invocation is cancelled."""
-        waiters = [
+        """Wait for settlement, cancellation, or opted-in inbox input."""
+        waiters: list[asyncio.Future[Any]] = [
             asyncio.ensure_future(self._manager.wait(task["task_id"]))
             for task in tasks
             if not is_task_status_terminal(task["status"])
         ]
+        if self._config.get("wake_on_input", False):
+            waiters.append(asyncio.ensure_future(self._agent._inbox.wait()))
         try:
             while waiters and not self._agent.cancel_signal.is_set():
                 settled, _ = await asyncio.wait(
@@ -454,7 +483,9 @@ class _BackgroundTasks(Plugin):
     def _persist_tasks(self) -> None:
         # Snapshot and write under one lock so a concurrent remove cannot be overwritten by a stale snapshot.
         with self._tasks_lock:
-            tasks = list(self._tasks.values())
+            tasks = [task.copy() for task in self._tasks.values()]
+            for task in tasks:
+                task.pop("progress", None)
             if tasks:
                 self._agent.state.set(_BACKGROUND_TASKS_STATE_KEY, tasks)
             else:

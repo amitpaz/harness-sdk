@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -34,6 +36,71 @@ DELEGATION_DESCRIPTION_SUFFIX = (
 )
 
 _INTERRUPTED_TURNS_KEY = "sub_agent_interrupted_turns"
+
+
+class _AgentToolProgress:
+    """Report bounded child activity without publishing every streamed text chunk."""
+
+    def __init__(self, report: Callable[[str], None]) -> None:
+        self._report = report
+        self._recent_text = ""
+        self._reported_text = ""
+        self._current_tool = ""
+        self._active_tools: dict[str, str] = {}
+        self._last_text_progress_at = 0.0
+
+    def update(self, event: dict[str, Any]) -> None:
+        """Read one dictionary emitted by ``Agent.stream_async``."""
+        if "current_tool_use" in event:
+            self._tool_use(event["current_tool_use"])
+            return
+        if "delta" in event:
+            self._text(event.get("data"))
+            return
+        if "tool_result" in event:
+            self._tool_result(event["tool_result"])
+
+    def flush(self) -> None:
+        """Publish the final excerpt if throttling held it back."""
+        if self._recent_text and self._recent_text != self._reported_text:
+            progress = f"{self._current_tool}: {self._recent_text}" if self._current_tool else self._recent_text
+            self._report(progress)
+            self._reported_text = self._recent_text
+
+    def _tool_use(self, tool_use: Any) -> None:
+        tool_name = tool_use.get("name") if isinstance(tool_use, dict) else None
+        if not isinstance(tool_name, str) or not tool_name:
+            return
+        tool_use_id = tool_use.get("toolUseId")
+        if isinstance(tool_use_id, str):
+            first_update = tool_use_id not in self._active_tools
+            self._active_tools[tool_use_id] = tool_name
+        else:
+            first_update = self._current_tool != tool_name
+        self._current_tool = tool_name
+        if first_update:
+            self._report(f"{tool_name}: working")
+
+    def _text(self, value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        self._recent_text = (self._recent_text + value)[-160:]
+        now = time.monotonic()
+        if now - self._last_text_progress_at >= 0.25:
+            self.flush()
+            self._last_text_progress_at = now
+
+    def _tool_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        status = result.get("status")
+        if not isinstance(status, str):
+            return
+        tool_use_id = result.get("toolUseId")
+        tool_name = self._active_tools.pop(tool_use_id, "tool") if isinstance(tool_use_id, str) else "tool"
+        self._report(f"{tool_name}: {status}")
+        if tool_name == self._current_tool:
+            self._current_tool = ""
 
 
 class _AgentAsTool(AgentTool):
@@ -214,6 +281,7 @@ class _AgentAsTool(AgentTool):
             )
             return
 
+        unregister_message = None
         try:
             if parent is not None and self._is_resuming(parent, prefix):
                 resumed = self._resume_from_interrupt(parent, tool_use, prefix)
@@ -231,6 +299,8 @@ class _AgentAsTool(AgentTool):
             # into its own event and never clears the parent's. A framework-supplied tool
             # context (background execution) carries the signal scoped to that call instead.
             tool_context = kwargs.get("_tool_context")
+            if tool_context is not None:
+                unregister_message = tool_context.on_message(self._agent.send)
             cancel_signal = (
                 tool_context.cancel_signal
                 if tool_context is not None
@@ -238,10 +308,15 @@ class _AgentAsTool(AgentTool):
             )
 
             result = None
+            progress = _AgentToolProgress(tool_context.report_progress) if tool_context is not None else None
             async for event in self._agent.stream_async(prompt, cancel_signal=cancel_signal):
                 if "result" in event:
                     result = event["result"]
+                    if progress is not None:
+                        progress.flush()
                 else:
+                    if progress is not None:
+                        progress.update(event)
                     yield AgentAsToolStreamEvent(tool_use, event, self)
 
             if result is None:
@@ -332,6 +407,8 @@ class _AgentAsTool(AgentTool):
                 }
             )
         finally:
+            if unregister_message is not None:
+                unregister_message()
             self._lock.release()
 
     def _reset_agent_state(self, tool_use_id: str) -> None:
@@ -351,6 +428,7 @@ class _AgentAsTool(AgentTool):
         self._agent.messages = copy.deepcopy(self._initial_messages)
         self._agent.state = AgentState(self._initial_state.get())
         self._agent._interrupt_state = _InterruptState()
+        self._agent._inbox.clear()
 
     def _is_resuming(self, parent: Agent, prefix: str) -> bool:
         """Whether the parent is holding an interrupt raised by this tool call."""

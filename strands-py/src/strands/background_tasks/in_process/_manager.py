@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import concurrent.futures
 import copy
+import inspect
 import math
 import threading
 import uuid
@@ -22,10 +24,11 @@ from strands.background_tasks._runtime import get_background_task_runtime
 from strands.background_tasks._types import BackgroundTask, BackgroundTaskInterrupt, is_task_status_terminal
 from strands.interrupt import Interrupt, InterruptException, _InterruptState
 from strands.types.agent import LocalAgent
+from strands.types.content import ContentBlock
 from strands.types.interrupt import InterruptResponse, InterruptResponseContent
-from strands.types.tools import AgentTool, ToolContext, ToolResult, ToolUse
+from strands.types.tools import AgentTool, ToolContext, ToolResult, ToolUse, _ToolMessageHandler
 
-from ._engine import InProcessTaskEngine
+from ._engine import _MAX_PROGRESS_LENGTH, InProcessTaskEngine
 from ._types import (
     CancelSignal,
     InProcessTaskExecutionContext,
@@ -55,6 +58,12 @@ class _LiveToolExecution:
     origin_loop: asyncio.AbstractEventLoop | None
 
 
+@dataclass(frozen=True)
+class _MessageRegistration:
+    handler: _ToolMessageHandler
+    loop: asyncio.AbstractEventLoop | None
+
+
 class _BackgroundToolContext(ToolContext[LocalAgent]):
     def __init__(
         self,
@@ -65,11 +74,15 @@ class _BackgroundToolContext(ToolContext[LocalAgent]):
         invocation_state: dict[str, Any],
         cancel_signal: threading.Event,
         interrupt_state: _InterruptState,
+        report_progress: Callable[[str], None],
+        register_message: Callable[[_ToolMessageHandler], Callable[[], None]],
     ) -> None:
         ToolContext.__init__(self, tool_use, agent, invocation_state)
         self._task_id = task_id
         self.cancel_signal = cancel_signal
         self._task_interrupt_state = interrupt_state
+        self._progress_reporter = report_progress
+        self._message_registrar = register_message
 
     def _interrupt_id(self, name: str) -> str:
         return f"v1:tool_call:{self._task_id}:{uuid.uuid5(uuid.NAMESPACE_OID, name)}"
@@ -112,6 +125,8 @@ class InProcessTaskManager:
         self._executions: dict[str, _LiveToolExecution] = {}
         self._task_id_by_submission: dict[tuple[str, str], str] = {}
         self._task_events: dict[str, asyncio.Event] = {}
+        self._message_handlers: dict[str, _MessageRegistration] = {}
+        self._message_handlers_lock = threading.Lock()
 
     async def submit(
         self,
@@ -168,6 +183,49 @@ class InProcessTaskManager:
         return await self._runtime.run(
             lambda: _to_background_task(self._engine.cancel(task_id, reason="Cancellation requested"))
         )
+
+    async def message(self, task_id: str, message: str | builtins.list[ContentBlock]) -> None:
+        """Deliver a message to a working task's registered handler.
+
+        Raises:
+            BackgroundTaskNotFoundError: If the task does not exist.
+            RuntimeError: If the task is no longer working or has no message handler.
+        """
+        return await self._runtime.run(lambda: self._message(task_id, message))
+
+    async def _message(self, task_id: str, message: str | builtins.list[ContentBlock]) -> None:
+        record = self._engine.get(task_id)
+        if record is None:
+            raise BackgroundTaskNotFoundError(task_id)
+        if record["status"] != "working":
+            raise RuntimeError(f"Background task '{task_id}' cannot accept messages in status '{record['status']}'")
+        with self._message_handlers_lock:
+            registration = self._message_handlers.get(task_id)
+        if registration is None:
+            raise RuntimeError(f"Background task '{task_id}' does not accept messages")
+        await self._invoke_message(task_id, registration, message)
+
+    async def _invoke_message(
+        self, task_id: str, registration: _MessageRegistration, message: str | builtins.list[ContentBlock]
+    ) -> None:
+        def call_handler() -> None | Awaitable[None]:
+            with self._message_handlers_lock:
+                if self._message_handlers.get(task_id) is not registration:
+                    raise RuntimeError(f"Background task '{task_id}' message handler is no longer available")
+            return registration.handler(copy.deepcopy(message))
+
+        async def invoke() -> None:
+            result = await asyncio.to_thread(call_handler) if registration.loop is None else call_handler()
+            if inspect.isawaitable(result):
+                await result
+
+        if registration.loop is None or registration.loop is asyncio.get_running_loop():
+            await invoke()
+            return
+        if registration.loop.is_closed():
+            raise RuntimeError(f"Background task '{task_id}' message handler loop is closed")
+        future = asyncio.run_coroutine_threadsafe(invoke(), registration.loop)
+        await asyncio.wrap_future(future)
 
     async def wait(self, task_id: str) -> BackgroundTask:
         """Wait until one task requires input or becomes terminal."""
@@ -269,6 +327,37 @@ class InProcessTaskManager:
         if execution is None:
             raise RuntimeError("Background task live execution state is unavailable")
         interrupt_state = _InterruptState.from_dict(context.state) if context.state is not None else _InterruptState()
+        runtime_loop = asyncio.get_running_loop()
+
+        def report_progress(text: str) -> None:
+            excerpt = text[-_MAX_PROGRESS_LENGTH:]
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is runtime_loop:
+                self._engine.report_progress(context.task_id, excerpt)
+            else:
+                runtime_loop.call_soon_threadsafe(self._engine.report_progress, context.task_id, excerpt)
+
+        def register_message(handler: _ToolMessageHandler) -> Callable[[], None]:
+            if context.cancel_signal.is_set():
+                return lambda: None
+            try:
+                handler_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                handler_loop = None
+            registration = _MessageRegistration(handler, handler_loop)
+            with self._message_handlers_lock:
+                self._message_handlers[context.task_id] = registration
+
+            def unregister() -> None:
+                with self._message_handlers_lock:
+                    if self._message_handlers.get(context.task_id) is registration:
+                        self._message_handlers.pop(context.task_id, None)
+
+            return unregister
+
         tool_context = _BackgroundToolContext(
             task_id=context.task_id,
             tool_use=execution.tool_use,
@@ -276,6 +365,8 @@ class InProcessTaskManager:
             invocation_state=execution.invocation_state,
             cancel_signal=context.cancel_signal,
             interrupt_state=interrupt_state,
+            report_progress=report_progress,
+            register_message=register_message,
         )
 
         def middleware_interrupt(
@@ -303,6 +394,9 @@ class InProcessTaskManager:
                 raise RuntimeError(f"Interrupt raised: {error.interrupt.name}") from error
             interrupt_state.activate()
             return {"status": "input_required", "state": interrupt_state.to_dict()}
+        finally:
+            with self._message_handlers_lock:
+                self._message_handlers.pop(context.task_id, None)
 
         if result["status"] == "success":
             return {"status": "completed", "result": result}
@@ -317,6 +411,8 @@ class InProcessTaskManager:
             changed = self._task_events.get(record["task_id"])
             if changed is not None:
                 changed.set()
+            with self._message_handlers_lock:
+                self._message_handlers.pop(record["task_id"], None)
         if is_task_status_terminal(record["status"]):
             self._executions.pop(record["invocation_state_id"], None)
         if self._on_task_updated is not None:
@@ -402,6 +498,8 @@ def _to_background_task(record: InProcessTaskRecord) -> BackgroundTask:
         ]
         if interrupts:
             task["interrupts"] = interrupts
+    if "progress" in record:
+        task["progress"] = copy.deepcopy(record["progress"])
     return task
 
 
