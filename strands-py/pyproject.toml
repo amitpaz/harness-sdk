@@ -48,7 +48,7 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.21.0,<1.0.0"]
 gemini = ["google-genai>=1.67.0,<3.0.0"]
-litellm = ["litellm>=1.95.0,<2.0.0", "openai>=1.68.0,<3.0.0"]
+litellm = ["litellm>=1.75.9,<2.0.0", "openai>=1.68.0,<3.0.0"]
 llamaapi = ["llama-api-client>=0.1.0,<1.0.0"]
 mistral = ["mistralai>=2.0.0,<4.0.0"]
 ollama = ["ollama>=0.4.8,<1.0.0"]
@@ -59,7 +59,10 @@ sagemaker = [
     "boto3-stubs[sagemaker-runtime]>=1.26.0,<2.0.0",
     "openai>=1.68.0,<3.0.0",  # SageMaker uses OpenAI-compatible interface
 ]
-otel = ["opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0"]
+otel = [
+    "opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0",
+    "opentelemetry-processor-baggage>=0.51b0,<1.00b0",
+]
 docs = [
     "sphinx>=5.0.0,<10.0.0",
     "sphinx-rtd-theme>=1.0.0,<4.0.0",
