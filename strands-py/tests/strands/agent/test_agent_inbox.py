@@ -204,3 +204,11 @@ def test_send_rejects_invalid_message(message: object) -> None:
     with pytest.raises(error):
         agent.send(message)  # type: ignore[arg-type]
     assert not agent._inbox.has_messages()
+
+
+@pytest.mark.parametrize("block", [{"toolUse": {}}, {"toolResult": {}}])
+def test_send_rejects_tool_protocol_blocks_before_enqueue(block) -> None:
+    agent = Agent(model=MockedModelProvider([]), callback_handler=null_callback_handler)
+    with pytest.raises(ValueError, match="tool-use or tool-result"):
+        agent.send([block])
+    assert not agent._inbox.has_messages()

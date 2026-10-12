@@ -639,7 +639,7 @@ class Agent(AgentBase, LocalAgent):
 
         Raises:
             TypeError: If the value is neither text nor a list of content blocks.
-            ValueError: If the content block list is empty.
+            ValueError: If the content block list is empty or contains tool protocol blocks.
         """
         if isinstance(message, str):
             content: list[ContentBlock] = [{"text": message}]
@@ -651,6 +651,8 @@ class Agent(AgentBase, LocalAgent):
                 for block in message
             ):
                 raise TypeError("message must contain content blocks")
+            if any("toolUse" in block or "toolResult" in block for block in message):
+                raise ValueError("send accepts user content, not tool-use or tool-result blocks")
             content = copy.deepcopy(message)
         else:
             raise TypeError("message must be a string or list of content blocks")
