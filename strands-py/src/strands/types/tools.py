@@ -5,8 +5,6 @@ These types are modeled after the Bedrock API.
 - Bedrock docs: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_Types_Amazon_Bedrock_Runtime.html
 """
 
-from __future__ import annotations
-
 import threading
 import uuid
 from abc import ABC, abstractmethod
@@ -33,7 +31,7 @@ _LocalAgentT = TypeVar("_LocalAgentT", bound="LocalAgent", default=Any)
 class _ToolMessageHandler(Protocol):
     """Handler for messages sent to a running background tool."""
 
-    def __call__(self, message: str | list[ContentBlock], **kwargs: Any) -> None | Awaitable[None]:
+    def __call__(self, message: "str | list[ContentBlock]", **kwargs: Any) -> None | Awaitable[None]:
         """Accept a message from the parent agent."""
         ...
 
