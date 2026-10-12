@@ -345,6 +345,8 @@ export class McpClient {
   /** Server-side name of each listed tool, which differs from `tool.name` when a prefix is set. */
   private _serverToolNames = new WeakMap<McpTool, string>()
   private _serverToolDefinitions = new Map<string, McpServerToolDefinition>()
+  /** Whether tools/list ran for this client, independent of how many tools it returned. */
+  private _serverToolsListed = false
   private _registeredToolNames = new Set<string>()
   private _onToolsChanged: ((oldTools: string[], newTools: McpTool[]) => void) | undefined
   private _refreshingTools = false
@@ -679,6 +681,7 @@ export class McpClient {
     }
 
     this._serverToolDefinitions = toolDefinitions
+    this._serverToolsListed = true
 
     // Per-call overrides are transient, so they must not become the baseline that a later
     // tools-changed refresh reports as the previously registered names.
@@ -889,10 +892,21 @@ export class McpClient {
     operation?: TaskOperation,
     completeLegacyTask = false
   ): Promise<McpToolCallOutcome> {
-    await this.connect(false, operation ? { signal: operation.signal } : undefined)
+    const connectSignal = operation?.signal ?? options.signal
+    await this.connect(false, connectSignal ? { signal: connectSignal } : undefined)
     if (this._state === 'failed') throw new Error('MCP server failed to connect. Call connect(true) to retry.')
 
     const params = this._prepareToolCall(tool, args)
+
+    // Task support is read from tools/list metadata, so a tool invoked before any listing
+    // fetches it once.
+    if (
+      completeLegacyTask &&
+      this._client.getNegotiatedProtocolVersion() === '2025-11-25' &&
+      this._client.getServerCapabilities()?.tasks?.requests?.tools?.call !== undefined
+    ) {
+      await this._ensureServerToolDefinitions(operation!)
+    }
 
     // The upstream codec rejects extension result types before custom result schemas run.
     if (completeLegacyTask && this._supportsLegacyTask(params.name)) {
@@ -1151,6 +1165,24 @@ export class McpClient {
     if (!this._supportsTaskExtension()) {
       throw new Error(`MCP server did not advertise the ${TASKS_EXTENSION} extension`)
     }
+  }
+
+  private async _ensureServerToolDefinitions(operation: TaskOperation): Promise<void> {
+    if (this._serverToolsListed) return
+    try {
+      const result = await this._client.listTools(undefined, {
+        timeout: remainingTime(operation.deadline, this._tasksConfig!.requestTimeoutMs),
+        signal: operation.signal,
+      })
+      this._serverToolDefinitions = new Map(result.tools.map((tool) => [tool.name, toMcpServerToolDefinition(tool)]))
+    } catch (error) {
+      // A cancelled or expired operation must surface as such, not as a listing failure.
+      if (operation.signal.aborted) throw error
+      logger.warn(`error=<${error}> | failed to list tools for legacy task support detection`)
+    }
+    // Set only once the listing settles: an aborted fetch must stay retryable, and a concurrent
+    // first call must not skip the fetch while this one is still in flight.
+    this._serverToolsListed = true
   }
 
   private async _callLegacyTask(params: CallToolRequest['params'], operation: TaskOperation): Promise<CallToolResult> {
