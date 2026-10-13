@@ -24,10 +24,7 @@ unregister()  # idempotent; removes only this registration
 
 `strands_manage_background_task` accepts `list`, `get`, `cancel`, and the new
 `message` mode with `task_id` and a string `message`. A successful message result
-contains `{task_id, message_sent: True}`. It acknowledges handler execution, not
-that a child model has processed the input. A task must be working and have a
-handler; unknown, queued, interrupted, terminal, and unsupported tasks produce
-clear errors. Input-required tasks still use the existing interrupt-response API.
+contains `{task_id, message_sent: True}` for a working task. It acknowledges handler execution, not that a child model has processed the input. A queued task instead returns `{task_id, message_queued: True, status: "queued"}`. Working tasks without a handler, unknown tasks, interrupted tasks, and terminal tasks still produce errors. Input-required tasks use the existing interrupt-response API.
 
 The methods on a foreground `ToolContext` are inert, so one tool implementation
 can run in either mode. A later message-handler registration replaces the earlier
@@ -40,6 +37,28 @@ last 512 characters of the latest update are retained, with an update counter an
 UTC timestamp. Reporting does not cause a parent model call. Agent-as-tool adapters
 register child `send` automatically and report tool activity/status and a short
 rolling text excerpt from the child stream. Custom tools use the same methods.
+
+## Messages sent before task execution
+
+A task waiting for a concurrency slot can accept messages before its tool registers `on_message`. The manager copies these messages into a per-task FIFO buffer. A successful manage-tool response contains this JSON payload:
+
+```json
+{"task_id": "...", "message_queued": true, "status": "queued"}
+```
+
+This acknowledges acceptance for later delivery, not successful delivery. It does not start the task or move it ahead of other tasks. Once the tool registers its handler, synchronous callbacks receive the buffered messages during registration, before registration returns. Async callbacks drain in order at the next cooperative yield; a short tool that returns immediately waits for its active initial drain before completing. The agent-as-tool adapter waits for initial delivery before starting the child invocation. Later messages to the working task wait behind the initial drain and retain the existing `message_sent: true` acknowledgment.
+
+Each task accepts at most 16 pending messages and 64 KiB of message data. The byte budget counts UTF-8 text, binary content, and structural overhead for content-block containers. Count or size overflow returns an error without adding the rejected message. Message bodies are copied at admission so subsequent caller mutation cannot change accepted instructions.
+
+If a task becomes completed, failed, or cancelled with accepted messages still undelivered, the manager drops those message bodies and adds a summary to its task snapshot:
+
+```json
+{"undelivered_messages": {"count": 2, "reason": "cancelled"}}
+```
+
+`reason` identifies the terminal task status. `get` and automatic result delivery expose this summary so a caller can report that the queued instructions were not confirmed delivered. A task that never calls `on_message` can finish normally but still carry this summary. In-flight callbacks interrupted during cancellation count as unconfirmed delivery; a callback may already have performed partial work before cancellation. Tasks with no undelivered messages omit the field.
+
+Pending message bodies remain in memory only and cannot resume after a process restart. Terminal summaries already recorded in task state can persist with normal task snapshots; they contain no message bodies. Handler unregister/replacement and cancellation coordinate with the initial drain to preserve FIFO order and prevent later messages from overtaking it.
 
 ## Activity history
 
@@ -115,7 +134,7 @@ signals.
 
 ## Persistence and concurrency
 
-Undelivered inbox messages, message handlers, live progress, and activity history are in-memory
+Undelivered inbox messages, queued-task message buffers, message handlers, live progress, and activity history are in-memory
 only. A restored session does not reconstruct them, and loading a snapshot clears
 the current inbox. Delivered messages persist like other conversation messages.
 Progress and activity history are excluded from persisted background task state; a progress excerpt
@@ -209,36 +228,36 @@ Baseline on the pinned tag:
   Both failures were existing short subprocess-timeout tests and passed together
   with `hatch test -n 0` before implementation.
 
-Final checks, including bounded activity history:
+Final checks, including bounded activity history and queued-task message delivery:
 
-- `hatch fmt --check`: Ruff, mypy (341 source files), and formatting (752 files) pass.
+- `hatch fmt --check`: Ruff, mypy (341 source files), and formatting (754 files) pass.
 - `hatch test --all -n 4`: full supported-version matrix; counts below.
-- `hatch test -n 4 tests/strands/background_tasks tests/strands/agent/test_agent_as_tool.py tests/strands/types/test_tools.py`: 141 focused tests; the full matrix also exercises them on every supported version.
+- The full matrix includes queued-message behavior for custom tools and agent-as-tool children, buffer limits, terminal diagnostics, and adversarial delivery/cancellation/handler-replacement regressions.
 - Existing agent-loop and continuation tests pass without modifying them.
 - `hatch build`: source and wheel packages build successfully.
 - `hatch run complexity`: informational `complexity/high`, maximum 61 in the
-  existing agent-as-tool stream function; new progress helper methods are at most 6.
+  existing agent-as-tool stream function. The queued-message drain helper scores 39; the progress helper methods are at most 6.
 - Local pre-commit formatting, lint/type checks, unit tests, and conventional
   commit checks pass. Local hook launchers only adapt the monorepo working directory.
 
-The coverage pre-push run also reproduced the baseline shell-timeout failure while other suites ran concurrently; the unchanged checks were rerun with two workers after the matrix finished.
+During the earlier activity-history validation, the coverage pre-push run also reproduced the baseline shell-timeout failure while other suites ran concurrently; the unchanged checks were rerun with two workers after the matrix finished.
 
 Provider-backed integration tests were not run: the repository reserves them for
 CI with credentials. Existing dependency deprecation/runtime warnings and the
 suite's platform/optional-dependency skips remain.
 
-The source patch applies cleanly to the cloned `origin/main` (`58158f7e9`) using
+At the activity-history revision (`15a700bcc`), the source patch applied cleanly to the cloned `origin/main` (`58158f7e9`) using
 `git apply --cached --check` against a temporary index; this is an application
 check, not a claim that the feature has been tested on main.
 
 | Python | Passed | Skipped |
 | --- | ---: | ---: |
-| 3.14 | 7,520 | 31 |
-| 3.13 | 7,520 | 31 |
-| 3.12 | 7,520 | 31 |
-| 3.11 | 7,398 | 35 |
-| 3.10 | 7,393 | 40 |
-| Total | 37,351 | 168 |
+| 3.14 | 7,534 | 31 |
+| 3.13 | 7,534 | 31 |
+| 3.12 | 7,534 | 31 |
+| 3.11 | 7,412 | 35 |
+| 3.10 | 7,407 | 40 |
+| Total | 37,421 | 168 |
 
 The table records the final frozen-source run, with no failures. The branch has
 not been rebased: it remains based on `python/v1.59.0`.

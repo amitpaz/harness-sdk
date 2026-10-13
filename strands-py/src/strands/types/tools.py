@@ -221,6 +221,7 @@ class ToolContext(_Interruptible, Generic[_LocalAgentT]):
     _message_registrar: Callable[[_ToolMessageHandler], Callable[[], None]] | None = field(
         default=None, repr=False, compare=False
     )
+    _message_drain_waiter: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
 
     def report_progress(self, text: str) -> None:
         """Report a short progress update for a background tool.
@@ -247,8 +248,11 @@ class ToolContext(_Interruptible, Generic[_LocalAgentT]):
     def on_message(self, handler: _ToolMessageHandler) -> Callable[[], None]:
         """Accept messages while this background tool is running.
 
-        A later registration replaces the previous handler. Call the returned function when the handler
-        is no longer available. Foreground calls return an inert unregister function.
+        Messages queued while the task waits to start are replayed in order when a handler registers.
+        Synchronous handlers receive that backlog before this method returns. Asynchronous handlers
+        start replay on the next event loop turn, and the task waits for an active replay before it
+        finishes. A later registration replaces the previous handler. Call the returned function when
+        the handler is no longer available. Foreground calls return an inert unregister function.
 
         Args:
             handler: Synchronous or asynchronous message handler.
@@ -264,6 +268,11 @@ class ToolContext(_Interruptible, Generic[_LocalAgentT]):
         if self._message_registrar is not None:
             return self._message_registrar(handler)
         return lambda: None
+
+    async def _wait_for_message_drain(self) -> None:
+        """Wait until messages accepted before handler registration have been delivered."""
+        if self._message_drain_waiter is not None:
+            await self._message_drain_waiter()
 
     def _interrupt_id(self, name: str) -> str:
         """Unique id for the interrupt.

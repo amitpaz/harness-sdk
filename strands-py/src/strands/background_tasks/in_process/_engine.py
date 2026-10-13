@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
+from typing import Literal
 from uuid import uuid4
 
 from strands.background_tasks._errors import BackgroundTaskNotFoundError
@@ -143,6 +144,19 @@ class InProcessTaskEngine:
         if task is not None:
             progress = task["progress"]
             self._append_activity(task_id, activity_type, progress["message"], timestamp=progress["updated_at"])
+
+    def record_undelivered_messages(
+        self, task_id: str, count: int, reason: Literal["completed", "failed", "cancelled"]
+    ) -> None:
+        """Record the number of queued messages discarded at task settlement."""
+        if count <= 0:
+            return
+
+        def update(record: InProcessTaskRecord) -> bool:
+            record["undelivered_messages"] = {"count": count, "reason": reason}
+            return True
+
+        self._update_task(task_id, update)
 
     def remove(self, task_id: str) -> None:
         """Remove a terminal task."""

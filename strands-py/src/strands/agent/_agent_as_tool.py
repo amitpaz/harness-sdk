@@ -306,6 +306,7 @@ class _AgentAsTool(AgentTool):
             tool_context = kwargs.get("_tool_context")
             if tool_context is not None:
                 unregister_message = tool_context.on_message(self._agent.send)
+                await tool_context._wait_for_message_drain()
             cancel_signal = (
                 tool_context.cancel_signal
                 if tool_context is not None

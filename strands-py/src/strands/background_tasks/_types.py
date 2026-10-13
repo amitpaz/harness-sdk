@@ -77,6 +77,13 @@ class BackgroundTaskProgress(TypedDict):
     updated_at: str
 
 
+class UndeliveredBackgroundMessages(TypedDict):
+    """Summary of queued messages discarded when a task became terminal."""
+
+    count: int
+    reason: Literal["completed", "failed", "cancelled"]
+
+
 class BackgroundTask(TypedDict):
     """Snapshot of one background task."""
 
@@ -90,6 +97,7 @@ class BackgroundTask(TypedDict):
     error: NotRequired[BackgroundTaskError]
     interrupts: NotRequired[list[BackgroundTaskInterrupt]]
     progress: NotRequired[BackgroundTaskProgress]
+    undelivered_messages: NotRequired[UndeliveredBackgroundMessages]
     activity: NotRequired[BackgroundTaskActivityHistory]
 
 

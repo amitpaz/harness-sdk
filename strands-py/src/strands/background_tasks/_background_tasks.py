@@ -170,16 +170,21 @@ class _BackgroundTasks(Plugin):
         if task is None:
             raise BackgroundTaskNotFoundError(task_id)
         if mode == "get":
-            if include_history:
-                live_task = await self._manager.get(task_id, include_history=True, after_sequence=after_sequence)
-                if live_task is None:
-                    raise RuntimeError("Activity history is unavailable for restored or removed background tasks")
+            live_task = await self._manager.get(task_id, include_history=include_history, after_sequence=after_sequence)
+            if live_task is None and include_history:
+                raise RuntimeError("Activity history is unavailable for restored or removed background tasks")
+            if live_task is not None:
                 task = live_task
             return {"status": "success", "content": _task_result_content(task)}
         if mode == "message":
             if message is None:
                 raise TypeError("Message is required for mode 'message'")
-            await self._manager.message(task_id, message)
+            queued = await self._manager.message(task_id, message)
+            if queued:
+                return {
+                    "status": "success",
+                    "content": [{"json": {"task_id": task_id, "message_queued": True, "status": "queued"}}],
+                }
             return {"status": "success", "content": [{"json": {"task_id": task_id, "message_sent": True}}]}
         if mode != "cancel":
             raise TypeError(f"Unknown background task mode '{mode}'")
