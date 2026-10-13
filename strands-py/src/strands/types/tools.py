@@ -215,6 +215,9 @@ class ToolContext(_Interruptible, Generic[_LocalAgentT]):
     # and compares by identity.
     cancel_signal: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     _progress_reporter: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
+    _activity_reporter: Callable[[str, Literal["tool_request", "tool_result"]], None] | None = field(
+        default=None, repr=False, compare=False
+    )
     _message_registrar: Callable[[_ToolMessageHandler], Callable[[], None]] | None = field(
         default=None, repr=False, compare=False
     )
@@ -234,6 +237,12 @@ class ToolContext(_Interruptible, Generic[_LocalAgentT]):
             raise TypeError("Progress text must be a string")
         if self._progress_reporter is not None:
             self._progress_reporter(text)
+
+    def _report_tool_activity(self, text: str, activity_type: Literal["tool_request", "tool_result"]) -> None:
+        if self._activity_reporter is not None:
+            self._activity_reporter(text, activity_type)
+        else:
+            self.report_progress(text)
 
     def on_message(self, handler: _ToolMessageHandler) -> Callable[[], None]:
         """Accept messages while this background tool is running.

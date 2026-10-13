@@ -41,6 +41,40 @@ UTC timestamp. Reporting does not cause a parent model call. Agent-as-tool adapt
 register child `send` automatically and report tool activity/status and a short
 rolling text excerpt from the child stream. Custom tools use the same methods.
 
+## Activity history
+
+Background tasks automatically retain the most recent 100 activity entries in memory, with messages capped at 512 characters. Ordinary `get`, `list`, and automatic result delivery remain compact. Request history explicitly:
+
+```json
+{"mode": "get", "task_id": "...", "include_history": true, "after_sequence": 17}
+```
+
+The task metadata then includes an `activity` object:
+
+```json
+{
+  "events": [
+    {"sequence": 18, "timestamp": "2026-10-13T10:02:15Z", "type": "progress", "message": "Reviewed 12 documents"}
+  ],
+  "first_available_sequence": 1,
+  "last_sequence": 18,
+  "truncated": false
+}
+```
+
+Events are ordered by a per-task sequence number assigned on the engine's owning event loop. `after_sequence` defaults to zero and returns retained events strictly newer than that cursor. Use `last_sequence` as the next cursor for the same task. `truncated` is true if entries after the requested cursor have already been dropped. `first_available_sequence` identifies the oldest retained entry even when the filtered result is empty. Negative, non-integer, and future cursors are rejected. History options are valid only for `get`, and a nonzero cursor requires `include_history=True`.
+
+The recorded types are:
+
+- `lifecycle`: actual background-task status transitions, including queued, working, input_required, completed, failed, and cancelled.
+- `progress`: explicit `report_progress` updates or the adapter's throttled text excerpts.
+- `tool_request`: a child model's streamed tool request, not proof that execution started or was approved.
+- `tool_result`: the response associated with a child tool call. Its success/error status describes that response; for nested background work it can be a dispatch acknowledgement, not completion of the nested task.
+
+The child adapter records each request once by tool-call ID and matches results by that ID, including when tools run concurrently. Messages sent to sub-agents and raw tool arguments/results are not copied into the timeline; entries contain short progress or activity descriptions. Text excerpts remain subject to the existing throttling, so this is a recent-activity view rather than a complete transcript.
+
+History is stored separately from normal task snapshots and is never included in persisted background task state. It is removed when the task is removed after automatic result delivery. Restored tasks have no activity history, and an explicit history request for them returns an availability error. A history response already added to conversation history is an ordinary tool result and may persist with that conversation. No new model calls, subscriptions, durable archive, or UI are introduced.
+
 ## Delivery and lifecycle
 
 `send` accepts user content, rejecting empty block lists and tool-use/tool-result
@@ -81,10 +115,10 @@ signals.
 
 ## Persistence and concurrency
 
-Undelivered inbox messages, message handlers, and live progress are in-memory
+Undelivered inbox messages, message handlers, live progress, and activity history are in-memory
 only. A restored session does not reconstruct them, and loading a snapshot clears
 the current inbox. Delivered messages persist like other conversation messages.
-Progress is removed from persisted background task state; a progress excerpt
+Progress and activity history are excluded from persisted background task state; a progress excerpt
 already delivered in a tool result is ordinary conversation history and may
 therefore persist. As before, unfinished background work cannot resume after
 restore and is recorded as failed.
@@ -175,18 +209,19 @@ Baseline on the pinned tag:
   Both failures were existing short subprocess-timeout tests and passed together
   with `hatch test -n 0` before implementation.
 
-Final checks:
+Final checks, including bounded activity history:
 
-- `hatch fmt --check`: Ruff, mypy (340 source files), and formatting (749 files) pass.
+- `hatch fmt --check`: Ruff, mypy (341 source files), and formatting (752 files) pass.
 - `hatch test --all -n 4`: full supported-version matrix; counts below.
-- `hatch test --all -n 2 tests/strands/types/test_tools.py tests/strands/agent/test_agent_inbox.py tests/strands/agent/test_agent_as_tool.py tests/strands/background_tasks`:
-  144 passed on each of Python 3.10–3.14.
+- `hatch test -n 4 tests/strands/background_tasks tests/strands/agent/test_agent_as_tool.py tests/strands/types/test_tools.py`: 141 focused tests; the full matrix also exercises them on every supported version.
 - Existing agent-loop and continuation tests pass without modifying them.
 - `hatch build`: source and wheel packages build successfully.
 - `hatch run complexity`: informational `complexity/high`, maximum 61 in the
   existing agent-as-tool stream function; new progress helper methods are at most 6.
 - Local pre-commit formatting, lint/type checks, unit tests, and conventional
   commit checks pass. Local hook launchers only adapt the monorepo working directory.
+
+The coverage pre-push run also reproduced the baseline shell-timeout failure while other suites ran concurrently; the unchanged checks were rerun with two workers after the matrix finished.
 
 Provider-backed integration tests were not run: the repository reserves them for
 CI with credentials. Existing dependency deprecation/runtime warnings and the
@@ -198,12 +233,12 @@ check, not a claim that the feature has been tested on main.
 
 | Python | Passed | Skipped |
 | --- | ---: | ---: |
-| 3.14 | 7,509 | 31 |
-| 3.13 | 7,509 | 31 |
-| 3.12 | 7,509 | 31 |
-| 3.11 | 7,387 | 35 |
-| 3.10 | 7,382 | 40 |
-| Total | 37,296 | 168 |
+| 3.14 | 7,520 | 31 |
+| 3.13 | 7,520 | 31 |
+| 3.12 | 7,520 | 31 |
+| 3.11 | 7,398 | 35 |
+| 3.10 | 7,393 | 40 |
+| Total | 37,351 | 168 |
 
 The table records the final frozen-source run, with no failures. The branch has
 not been rebased: it remains based on `python/v1.59.0`.

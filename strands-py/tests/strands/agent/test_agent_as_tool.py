@@ -21,6 +21,7 @@ from strands.types._events import (
     ToolStreamEvent,
     ToolUseStreamEvent,
 )
+from strands.types.tools import ToolContext
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 
@@ -270,14 +271,21 @@ async def test_background_child_reports_tool_and_text_progress(tool, mock_agent,
         TextStreamEvent({"text": "answer"}, "answer").as_dict(),
     ]
     mock_agent.stream_async.return_value = _mock_stream_async(agent_result, intermediate)
-    tool_context = MagicMock()
-    tool_context.on_message.return_value = MagicMock()
+    report_progress = MagicMock()
+    report_activity = MagicMock()
+    tool_context = ToolContext(
+        tool_use=tool_use,
+        agent=mock_agent,
+        invocation_state={},
+        _progress_reporter=report_progress,
+        _activity_reporter=report_activity,
+    )
 
     events = [event async for event in tool.stream(tool_use, {}, _tool_context=tool_context)]
 
     assert len([event for event in events if isinstance(event, AgentAsToolStreamEvent)]) == 3
-    assert [call.args[0] for call in tool_context.report_progress.call_args_list] == [
-        "lookup: working",
+    assert [call.args for call in report_activity.call_args_list] == [("lookup: requested", "tool_request")]
+    assert [call.args[0] for call in report_progress.call_args_list] == [
         "lookup: found ",
         "lookup: found answer",
     ]
@@ -292,17 +300,51 @@ async def test_background_child_attributes_parallel_tool_results_by_id(tool, moc
         ToolResultEvent({"toolUseId": "b", "status": "error", "content": []}).as_dict(),
     ]
     mock_agent.stream_async.return_value = _mock_stream_async(agent_result, intermediate)
-    tool_context = MagicMock()
-    tool_context.on_message.return_value = MagicMock()
+    report_progress = MagicMock()
+    report_activity = MagicMock()
+    tool_context = ToolContext(
+        tool_use=tool_use,
+        agent=mock_agent,
+        invocation_state={},
+        _progress_reporter=report_progress,
+        _activity_reporter=report_activity,
+    )
 
     async for _ in tool.stream(tool_use, {}, _tool_context=tool_context):
         pass
 
-    assert [call.args[0] for call in tool_context.report_progress.call_args_list] == [
-        "first: working",
-        "second: working",
-        "first: success",
-        "second: error",
+    assert [call.args for call in report_activity.call_args_list] == [
+        ("first: requested", "tool_request"),
+        ("second: requested", "tool_request"),
+        ("first: result (success)", "tool_result"),
+        ("second: result (error)", "tool_result"),
+    ]
+    report_progress.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_background_child_reports_tool_activity_as_progress_without_typed_callback(
+    tool, mock_agent, tool_use, agent_result
+):
+    intermediate = [
+        ToolUseStreamEvent({"toolUse": {"input": ""}}, {"name": "lookup", "toolUseId": "lookup-use"}).as_dict(),
+        ToolResultEvent({"toolUseId": "lookup-use", "status": "success", "content": []}).as_dict(),
+    ]
+    mock_agent.stream_async.return_value = _mock_stream_async(agent_result, intermediate)
+    report_progress = MagicMock()
+    tool_context = ToolContext(
+        tool_use=tool_use,
+        agent=mock_agent,
+        invocation_state={},
+        _progress_reporter=report_progress,
+    )
+
+    async for _ in tool.stream(tool_use, {}, _tool_context=tool_context):
+        pass
+
+    assert [call.args[0] for call in report_progress.call_args_list] == [
+        "lookup: requested",
+        "lookup: result (success)",
     ]
 
 

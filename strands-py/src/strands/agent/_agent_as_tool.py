@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 from typing_extensions import override
@@ -41,8 +41,13 @@ _INTERRUPTED_TURNS_KEY = "sub_agent_interrupted_turns"
 class _AgentToolProgress:
     """Report bounded child activity without publishing every streamed text chunk."""
 
-    def __init__(self, report: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        report: Callable[[str], None],
+        report_tool_activity: Callable[[str, Literal["tool_request", "tool_result"]], None] | None = None,
+    ) -> None:
         self._report = report
+        self._report_tool_activity = report_tool_activity or (lambda text, activity_type: report(text))
         self._recent_text = ""
         self._reported_text = ""
         self._current_tool = ""
@@ -79,7 +84,7 @@ class _AgentToolProgress:
             first_update = self._current_tool != tool_name
         self._current_tool = tool_name
         if first_update:
-            self._report(f"{tool_name}: working")
+            self._report_tool_activity(f"{tool_name}: requested", "tool_request")
 
     def _text(self, value: Any) -> None:
         if not isinstance(value, str) or not value:
@@ -98,7 +103,7 @@ class _AgentToolProgress:
             return
         tool_use_id = result.get("toolUseId")
         tool_name = self._active_tools.pop(tool_use_id, "tool") if isinstance(tool_use_id, str) else "tool"
-        self._report(f"{tool_name}: {status}")
+        self._report_tool_activity(f"{tool_name}: result ({status})", "tool_result")
         if tool_name == self._current_tool:
             self._current_tool = ""
 
@@ -308,7 +313,11 @@ class _AgentAsTool(AgentTool):
             )
 
             result = None
-            progress = _AgentToolProgress(tool_context.report_progress) if tool_context is not None else None
+            progress = (
+                _AgentToolProgress(tool_context.report_progress, tool_context._report_tool_activity)
+                if tool_context is not None
+                else None
+            )
             async for event in self._agent.stream_async(prompt, cancel_signal=cancel_signal):
                 if "result" in event:
                     result = event["result"]

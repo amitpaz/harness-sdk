@@ -22,11 +22,26 @@ def _answer(text: str) -> dict[str, object]:
     return {"role": "assistant", "content": [{"text": text}]}
 
 
-async def _manage(agent: Agent, mode: str, task_id: str, message: str | None = None) -> ToolResult:
+async def _manage(
+    agent: Agent,
+    mode: str,
+    task_id: str,
+    message: str | None = None,
+    *,
+    include_history: bool = False,
+    after_sequence: int | None = None,
+) -> ToolResult:
+    tool_input: dict[str, object] = {"mode": mode, "task_id": task_id}
+    if message is not None:
+        tool_input["message"] = message
+    if include_history:
+        tool_input["include_history"] = True
+    if after_sequence is not None:
+        tool_input["after_sequence"] = after_sequence
     tool_use: ToolUse = {
         "name": "strands_manage_background_task",
         "toolUseId": f"manage-{mode}",
-        "input": {"mode": mode, "task_id": task_id, **({"message": message} if message is not None else {})},
+        "input": tool_input,
     }
     result: ToolResult | None = None
     manage_tool = agent.tool_registry.registry["strands_manage_background_task"]
@@ -74,14 +89,21 @@ async def test_running_background_child_reports_progress_and_receives_message() 
         task_id = parent.state.get("strands.background_tasks")[0]["task_id"]
 
         for _ in range(100):
-            status = await _manage(parent, "get", task_id)
+            status = await _manage(parent, "get", task_id, include_history=True)
             if "progress" in status["content"][0]["json"]:
                 break
             await asyncio.sleep(0.01)
         else:
             pytest.fail("Child progress was not published")
 
-        assert "hold" in str(status["content"][0]["json"]["progress"])
+        snapshot = status["content"][0]["json"]
+        assert "hold" in str(snapshot["progress"])
+        activity = snapshot["activity"]
+        tool_requests = [event for event in activity["events"] if event["type"] == "tool_request"]
+        assert [(event["type"], event["message"]) for event in tool_requests] == [("tool_request", "hold: requested")]
+        request_sequence = tool_requests[0]["sequence"]
+        later = await _manage(parent, "get", task_id, include_history=True, after_sequence=request_sequence)
+        assert later["content"][0]["json"]["activity"]["events"] == []
         sent = await _manage(parent, "message", task_id, "Also check the new constraint")
         assert sent["status"] == "success"
     finally:

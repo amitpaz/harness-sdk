@@ -125,12 +125,18 @@ class _BackgroundTasks(Plugin):
         name=_MANAGE_TOOL_NAME,
         description=(
             "List, get progress, message, or cancel background tasks. "
+            "Use get with include_history for recent activity, optionally after_sequence for newer entries. "
             "Results are delivered automatically as synthetic 'get' calls. "
             "Do not poll for results."
         ),
     )
     async def _manage_background_task(
-        self, mode: Literal["list", "get", "message", "cancel"], task_id: str | None = None, message: str | None = None
+        self,
+        mode: Literal["list", "get", "message", "cancel"],
+        task_id: str | None = None,
+        message: str | None = None,
+        include_history: bool = False,
+        after_sequence: int = 0,
     ) -> dict[str, Any]:
         """Manage tracked background tasks.
 
@@ -138,12 +144,19 @@ class _BackgroundTasks(Plugin):
             mode: Whether to list, inspect, message, or cancel background tasks.
             task_id: The background task ID returned when dispatched. Required except for list.
             message: Input for a running task that accepts messages. Required for message mode.
+            include_history: Include up to 100 recent activity entries in get. Defaults to False.
+            after_sequence: Only include entries after this sequence number. Requires include_history.
 
         Raises:
             TypeError: If required arguments are missing or the mode is unknown.
             BackgroundTaskNotFoundError: If the task is unknown.
-            RuntimeError: If the task cannot accept a message.
+            RuntimeError: If the task cannot accept a message or its history is unavailable.
+            ValueError: If history options are invalid or the cursor is outside the task's history.
         """
+        if (include_history or after_sequence != 0) and mode != "get":
+            raise ValueError("Activity history options are only supported for mode 'get'")
+        if after_sequence != 0 and not include_history:
+            raise ValueError("after_sequence requires include_history=True")
         if mode == "list":
             listing = [
                 {"task_id": task["task_id"], "tool_name": task["tool_name"], "status": task["status"]}
@@ -157,6 +170,11 @@ class _BackgroundTasks(Plugin):
         if task is None:
             raise BackgroundTaskNotFoundError(task_id)
         if mode == "get":
+            if include_history:
+                live_task = await self._manager.get(task_id, include_history=True, after_sequence=after_sequence)
+                if live_task is None:
+                    raise RuntimeError("Activity history is unavailable for restored or removed background tasks")
+                task = live_task
             return {"status": "success", "content": _task_result_content(task)}
         if mode == "message":
             if message is None:
@@ -264,6 +282,7 @@ class _BackgroundTasks(Plugin):
         tasks: dict[str, BackgroundTask] = {}
         for task in stored:
             task.pop("progress", None)
+            task.pop("activity", None)
             if not is_task_status_terminal(task["status"]):
                 recovered_interrupt_ids.update(interrupt["id"] for interrupt in task.pop("interrupts", []))
                 task["status"] = "failed"
@@ -486,6 +505,7 @@ class _BackgroundTasks(Plugin):
             tasks = [task.copy() for task in self._tasks.values()]
             for task in tasks:
                 task.pop("progress", None)
+                task.pop("activity", None)
             if tasks:
                 self._agent.state.set(_BACKGROUND_TASKS_STATE_KEY, tasks)
             else:

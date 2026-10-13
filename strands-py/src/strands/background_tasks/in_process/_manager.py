@@ -12,6 +12,7 @@ import threading
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal, Protocol
 
 from strands._async import is_run_async_bridge
@@ -76,6 +77,7 @@ class _BackgroundToolContext(ToolContext[LocalAgent]):
         interrupt_state: _InterruptState,
         report_progress: Callable[[str], None],
         register_message: Callable[[_ToolMessageHandler], Callable[[], None]],
+        report_activity: Callable[[str, Literal["tool_request", "tool_result"]], None],
     ) -> None:
         ToolContext.__init__(self, tool_use, agent, invocation_state)
         self._task_id = task_id
@@ -83,6 +85,7 @@ class _BackgroundToolContext(ToolContext[LocalAgent]):
         self._task_interrupt_state = interrupt_state
         self._progress_reporter = report_progress
         self._message_registrar = register_message
+        self._activity_reporter = report_activity
 
     def _interrupt_id(self, name: str) -> str:
         return f"v1:tool_call:{self._task_id}:{uuid.uuid5(uuid.NAMESPACE_OID, name)}"
@@ -164,11 +167,28 @@ class InProcessTaskManager:
 
         return await self._runtime.run(submit)
 
-    async def get(self, task_id: str) -> BackgroundTask | None:
-        """Get one task."""
-        return await self._runtime.run(
-            lambda: _to_background_task(record) if (record := self._engine.get(task_id)) is not None else None
-        )
+    async def get(
+        self, task_id: str, *, include_history: bool = False, after_sequence: int = 0
+    ) -> BackgroundTask | None:
+        """Get a task and optionally its retained activity from one runtime snapshot.
+
+        Raises:
+            ValueError: If the cursor is not a nonnegative integer, is out of range,
+                or is supplied without requesting history.
+        """
+        if not include_history and after_sequence != 0:
+            raise ValueError("after_sequence requires include_history=True")
+
+        def get() -> BackgroundTask | None:
+            record = self._engine.get(task_id)
+            if record is None:
+                return None
+            task = _to_background_task(record)
+            if include_history:
+                task["activity"] = self._engine.get_activity(task_id, after_sequence=after_sequence)
+            return task
+
+        return await self._runtime.run(get)
 
     async def list(self) -> list[BackgroundTask]:
         """List tracked tasks."""
@@ -329,16 +349,19 @@ class InProcessTaskManager:
         interrupt_state = _InterruptState.from_dict(context.state) if context.state is not None else _InterruptState()
         runtime_loop = asyncio.get_running_loop()
 
-        def report_progress(text: str) -> None:
+        def report_activity(
+            text: str, activity_type: Literal["progress", "tool_request", "tool_result"] = "progress"
+        ) -> None:
             excerpt = text[-_MAX_PROGRESS_LENGTH:]
+            report = partial(self._engine.report_progress, context.task_id, excerpt, activity_type=activity_type)
             try:
                 current_loop = asyncio.get_running_loop()
             except RuntimeError:
                 current_loop = None
             if current_loop is runtime_loop:
-                self._engine.report_progress(context.task_id, excerpt)
+                report()
             else:
-                runtime_loop.call_soon_threadsafe(self._engine.report_progress, context.task_id, excerpt)
+                runtime_loop.call_soon_threadsafe(report)
 
         def register_message(handler: _ToolMessageHandler) -> Callable[[], None]:
             if context.cancel_signal.is_set():
@@ -365,8 +388,9 @@ class InProcessTaskManager:
             invocation_state=execution.invocation_state,
             cancel_signal=context.cancel_signal,
             interrupt_state=interrupt_state,
-            report_progress=report_progress,
+            report_progress=report_activity,
             register_message=register_message,
+            report_activity=report_activity,
         )
 
         def middleware_interrupt(

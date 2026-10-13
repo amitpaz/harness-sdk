@@ -9,6 +9,8 @@ from typing_extensions import NotRequired, TypedDict
 
 from strands.types.tools import AgentTool, ToolResultContent
 
+from .in_process._activity import BackgroundTaskActivityHistory
+
 
 class BackgroundTasksConfig(TypedDict, total=False):
     """Configure background tool execution.
@@ -88,6 +90,7 @@ class BackgroundTask(TypedDict):
     error: NotRequired[BackgroundTaskError]
     interrupts: NotRequired[list[BackgroundTaskInterrupt]]
     progress: NotRequired[BackgroundTaskProgress]
+    activity: NotRequired[BackgroundTaskActivityHistory]
 
 
 def is_task_status_terminal(status: BackgroundTaskStatus) -> bool:
